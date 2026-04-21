@@ -1,0 +1,11 @@
+[project]
+name = "streamlit-query-studio"
+requires-python = ">= 3.11"
+version = "1.0.0"
+description = "Metadata-driven Streamlit framework for Snowflake"
+dependencies = [
+    "streamlit[snowflake]"
+]
+
+[tool.uv]
+constraint-dependencies = ["numba>=0.56.0"]

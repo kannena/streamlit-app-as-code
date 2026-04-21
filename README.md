@@ -7,9 +7,9 @@
 A framework engine that reads a YAML config and a SQL template, then renders a complete interactive Streamlit application — filters, query execution, pagination, export, audit logging, row-level security, and more.
 
 ```
-app_config.yaml  ─→ ┐
-queries.sql      ─→ ├─→  main_streamlit_app.py  ─→  Live Streamlit App
-framework_config ─→ ┘
+config.yaml  ─→ ┐
+queries.sql      ─→ ├─→  engine.py  ─→  Live Streamlit App
+default_config ─→ ┘
 ```
 
 **One engine. Unlimited apps. Zero per-app Python.**
@@ -19,11 +19,11 @@ framework_config ─→ ┘
 ```mermaid
 graph TD
     subgraph "GitHub Repository"
-        FW[framework/] --> |shared engine| ENGINE[main_streamlit_app.py]
-        FW --> |defaults| FWCFG[framework_config.yaml]
-        APP1[sample_apps/customer_orders_qs/] --> CFG1[app_config.yaml]
+        FW[framework/] --> |shared engine| ENGINE[engine.py]
+        FW --> |defaults| FWCFG[default_config.yaml]
+        APP1[sample_apps/customer_orders_qs/] --> CFG1[config.yaml]
         APP1 --> SQL1[queries.sql]
-        APP2[sample_apps/revenue_analysis_qs/] --> CFG2[app_config.yaml]
+        APP2[sample_apps/revenue_analysis_qs/] --> CFG2[config.yaml]
         APP2 --> SQL2[queries.sql]
     end
 
@@ -77,11 +77,11 @@ CREATE STAGE IF NOT EXISTS my_schema.STREAMLIT_STG;
 
 -- Upload all framework/*.py files to @STREAMLIT_STG/customer_orders_qs/
 -- Upload sample_apps/customer_orders_qs/queries.sql
--- Merge framework_config.yaml + app_config.yaml → config.yaml and upload
+-- Merge default_config.yaml + config.yaml → config.yaml and upload
 
 CREATE OR ALTER STREAMLIT my_db.my_schema.customer_orders_qs
     ROOT_LOCATION = '@my_db.my_schema.STREAMLIT_STG/customer_orders_qs'
-    MAIN_FILE     = 'main_streamlit_app.py'
+    MAIN_FILE     = 'engine.py'
     TITLE         = 'Customer Orders Query Studio'
     QUERY_WAREHOUSE = 'MY_WH';
 ```
@@ -89,7 +89,7 @@ CREATE OR ALTER STREAMLIT my_db.my_schema.customer_orders_qs
 ### 3. Create Your Own App
 
 1. Create a new folder under your schema
-2. Write `app_config.yaml` defining your filters, security, and export settings
+2. Write `config.yaml` defining your filters, security, and export settings
 3. Write `queries.sql` with your business logic
 4. Deploy using the CI/CD pipeline or manual upload
 
@@ -99,24 +99,24 @@ CREATE OR ALTER STREAMLIT my_db.my_schema.customer_orders_qs
 
 ```
 ├── framework/                    # Shared engine (deploy to every app)
-│   ├── main_streamlit_app.py     # Core engine (~500 lines)
-│   ├── framework_config.yaml     # Default settings for all apps
-│   ├── init_manager.py           # Environment detection, DB resolution
-│   ├── global_filters.py         # Saved filter presets + folder UI
-│   ├── audit_logger.py           # Async batch audit logging
-│   ├── session_cache_manager.py  # TTL-based session caching
-│   ├── disclaimer_manager.py     # Version-aware disclaimer acceptance
-│   ├── subscription_manager.py   # Report subscription scheduling
-│   ├── utils_permissions.py      # RBAC helper functions
+│   ├── engine.py     # Core engine (~500 lines)
+│   ├── default_config.yaml     # Default settings for all apps
+│   ├── env_resolver.py           # Environment detection, DB resolution
+│   ├── filter_presets.py         # Saved filter presets + folder UI
+│   ├── audit.py           # Async batch audit logging
+│   ├── cache.py  # TTL-based session caching
+│   ├── disclaimer.py     # Version-aware disclaimer acceptance
+│   ├── subscriptions.py   # Report subscription scheduling
+│   ├── permissions.py      # RBAC helper functions
 │   ├── environment.yml           # Conda dependencies
 │   └── pyproject.toml            # Package metadata
 │
 ├── sample_apps/                  # Example apps (YAML + SQL only)
 │   ├── customer_orders_qs/       # Simple: 3 cascading filters
-│   │   ├── app_config.yaml
+│   │   ├── config.yaml
 │   │   └── queries.sql
 │   └── revenue_analysis_qs/     # Complex: AND/OR deps, optional SQL
-│       ├── app_config.yaml
+│       ├── config.yaml
 │       └── queries.sql
 │
 ├── mock_snowflake/               # Database setup for testing
@@ -184,7 +184,7 @@ Results are injected into the WHERE clause so users only see data for their auth
 The GitHub Actions workflow provides:
 
 - **Smart change detection**: framework change → deploy all apps; app change → deploy only that app
-- **Config merging**: `framework_config.yaml` + `app_config.yaml` → `config.yaml`
+- **Config merging**: `default_config.yaml` + `config.yaml` → `config.yaml`
 - **Key-pair authentication**: no passwords stored
 - **Manual triggers**: deploy all, specific schema, or skip
 

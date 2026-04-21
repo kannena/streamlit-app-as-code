@@ -1,0 +1,223 @@
+# =============================================================================
+# Sample App 2: Revenue Analysis Query Studio (Complex)
+# =============================================================================
+# Demonstrates advanced App-as-Code features:
+#   - AND/OR filter dependencies (["region|department", "fiscal_year"])
+#   - Optional conditional SQL  {?filter_name:condition}
+#   - Security CTE injection via inject_to_security_cte flag
+#   - Date filter with quarter/month pattern
+#   - Multiple export formats
+#   - Subscription support
+
+app_info:
+  title: "Revenue Analysis Query Studio"
+  page_title: "Revenue Analysis"
+  page_icon: "💰"
+  page_layout: "wide"
+
+database:
+  warehouse: "{ENVIRON}ANALYTICS_WH"
+  fallback_warehouse: "{ENVIRON}DEFAULT_WH"
+  show_warehouse_info: false
+  filter_warehouse_mode: "inherit"
+
+debug:
+  show_generated_sql: false
+  show_failed_sql: true
+
+filters:
+  region:
+    label: "Region"
+    order: 1
+    mandatory: false
+    for_more: false
+    sql: >
+      SELECT DISTINCT CONCAT(region_code, ' - ', region_name) AS region
+      FROM {DB}.corp.dim_org_hierarchy
+      WHERE is_current = 1
+        AND region_code IN ({security_divisions})
+      ORDER BY 1
+    depends_on: []
+    placeholder: "Select Region..."
+    input_type: "checkbox"
+    sql_condition: "CONCAT(oh.region_code, ' - ', oh.region_name) IN ({region})"
+    allow_multiple: true
+    include_in_where: true
+    description: "Filter by geographic region"
+
+  department:
+    label: "Department"
+    order: 2
+    mandatory: false
+    for_more: false
+    sql: >
+      SELECT DISTINCT CONCAT(department_code, ' - ', department_name) AS dept
+      FROM {DB}.corp.dim_org_hierarchy
+      WHERE is_current = 1
+        AND CONCAT(region_code, ' - ', region_name) IN ({region})
+        AND region_code IN ({security_divisions})
+      ORDER BY 1
+    depends_on: ["region"]
+    placeholder: "Select Department..."
+    input_type: "checkbox"
+    sql_condition: "CONCAT(oh.department_code, ' - ', oh.department_name) IN ({department})"
+    allow_multiple: true
+    include_in_where: true
+    description: "Select departments (requires Region)"
+
+  team:
+    label: "Team"
+    order: 3
+    mandatory: false
+    for_more: false
+    sql: >
+      SELECT DISTINCT CONCAT(team_code, ' - ', team_name) AS team
+      FROM {DB}.corp.dim_org_hierarchy
+      WHERE is_current = 1
+        {?department: AND CONCAT(department_code, ' - ', department_name) IN ({department})}
+        AND region_code IN ({security_divisions})
+      ORDER BY 1
+    # AND/OR dependency: (region OR department) AND fiscal_year
+    depends_on: ["region|department"]
+    placeholder: "Select Team..."
+    input_type: "checkbox"
+    sql_condition: "CONCAT(oh.team_code, ' - ', oh.team_name) IN ({team})"
+    allow_multiple: true
+    include_in_where: true
+    description: "Requires Region or Department. Uses {?department:...} optional conditional."
+
+  fiscal_year:
+    label: "Fiscal Year"
+    order: 4
+    mandatory: false
+    for_more: false
+    sql: >
+      SELECT DISTINCT fiscal_year
+      FROM {DB}.analytics.dim_fiscal_calendar
+      WHERE fiscal_year >= YEAR(CURRENT_DATE()) - 3
+      ORDER BY fiscal_year DESC
+    depends_on: []
+    placeholder: "Select Year..."
+    input_type: "checkbox"
+    sql_condition: "fc.fiscal_year IN ({fiscal_year})"
+    allow_multiple: true
+    include_in_where: true
+    description: "Filter by fiscal year"
+
+  fiscal_quarter:
+    label: "Fiscal Quarter"
+    order: 5
+    mandatory: false
+    for_more: false
+    sql: >
+      SELECT DISTINCT fiscal_quarter
+      FROM {DB}.analytics.dim_fiscal_calendar
+      WHERE fiscal_year IN ({fiscal_year})
+      ORDER BY 1
+    depends_on: ["fiscal_year"]
+    placeholder: "Select Quarter..."
+    input_type: "checkbox"
+    sql_condition: "fc.fiscal_quarter IN ({fiscal_quarter})"
+    allow_multiple: true
+    include_in_where: true
+    description: "Filter by quarter (requires Fiscal Year)"
+
+  revenue_type:
+    label: "Revenue Type"
+    order: 6
+    mandatory: false
+    for_more: true
+    sql: >
+      SELECT DISTINCT revenue_type
+      FROM {DB}.analytics.fact_revenue
+      ORDER BY 1
+    depends_on: []
+    placeholder: "Select Type..."
+    input_type: "checkbox"
+    sql_condition: "r.revenue_type IN ({revenue_type})"
+    allow_multiple: true
+    include_in_where: true
+    description: "Optional: filter by revenue category"
+
+  customer_name:
+    label: "Customer Name"
+    order: 7
+    mandatory: false
+    for_more: true
+    placeholder: "Search customer..."
+    input_type: "text"
+    depends_on: []
+    sql_condition: "c.customer_name ILIKE '%{customer_name}%'"
+    include_in_where: true
+    description: "Free-text customer search"
+
+  min_revenue:
+    label: "Minimum Revenue ($)"
+    order: 8
+    mandatory: false
+    for_more: true
+    placeholder: "e.g., 10000"
+    input_type: "text"
+    depends_on: []
+    sql_condition: "r.revenue_amount >= {min_revenue}"
+    include_in_where: true
+    description: "Show only records above this revenue threshold"
+
+  column_selection:
+    label: "Columns to Display"
+    order: 99
+    for_more: true
+    input_type: "column_selector"
+    default_columns:
+      - "REGION"
+      - "DEPARTMENT"
+      - "CUSTOMER_NAME"
+      - "FISCAL_YEAR"
+      - "FISCAL_QUARTER"
+      - "REVENUE_TYPE"
+      - "REVENUE_AMOUNT"
+    all_columns:
+      - "REGION"
+      - "DEPARTMENT"
+      - "TEAM"
+      - "CUSTOMER_NAME"
+      - "ACCOUNT_NUMBER"
+      - "FISCAL_YEAR"
+      - "FISCAL_QUARTER"
+      - "FISCAL_MONTH"
+      - "REVENUE_TYPE"
+      - "REVENUE_AMOUNT"
+      - "COST_AMOUNT"
+      - "MARGIN_AMOUNT"
+      - "MARGIN_PERCENT"
+      - "TRANSACTION_COUNT"
+
+security_filter:
+  enabled: true
+  query: >
+    SELECT DISTINCT region_code
+    FROM {DB}.security.user_access_map
+    WHERE LOWER(employee_login) = LOWER('{current_user}')
+      AND is_active = TRUE
+  filter_column: "region_code"
+  table_alias: "oh"
+  include_in_where: true
+
+export:
+  formats:
+    csv:
+      enabled: true
+      label: "📄 Download CSV"
+      bundle_as_zip: true
+      include_filter_file: true
+
+subscriptions:
+  enabled: true
+
+global_filters:
+  catalog_table:
+    schema: "{DB}.app_metadata"
+    name: "global_filter_catalog"
+  folder_table:
+    schema: "{DB}.app_metadata"
+    name: "global_filter_folders"
