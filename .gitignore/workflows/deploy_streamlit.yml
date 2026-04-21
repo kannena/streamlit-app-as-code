@@ -9,10 +9,10 @@ name: Deploy Streamlit Apps
 on:
   push:
     branches:
-      - develop
+      - main
     paths:
-      - "streamlit/framework/**"
-      - "streamlit/*/*/**"
+      - "framework/**"
+      - "sample_apps/**"
       - ".github/workflows/deploy_streamlit.yml"
   workflow_dispatch:
     inputs:
@@ -57,6 +57,7 @@ jobs:
       SNOWFLAKE_COMPUTE_POOL: ${{ secrets.SNOWFLAKE_COMPUTE_POOL }}
       SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
       SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_PASSPHRASE }}
+      SNOWFLAKE_SCHEMA:     ${{ secrets.SNOWFLAKE_SCHEMA }}
 
     steps:
       - name: Checkout code
@@ -85,14 +86,14 @@ jobs:
               echo "changed_files=SKIP_DEPLOYMENT" >> $GITHUB_OUTPUT
               exit 0
             elif [ "$SCOPE" = "specific-schema" ] && [ -n "$SCHEMA" ]; then
-              FILES=$(find . -path "./streamlit/$SCHEMA/*/**" -type f \
+              FILES=$(find . -path "./sample_apps/$SCHEMA/*" -type f \
                       | sed 's|^\./||' || echo "")
               echo "changed_files=$(echo "$FILES" | tr '\n' ',' | sed 's/,$//')" >> $GITHUB_OUTPUT
               exit 0
             else
-              FILES=$(find . -path "./streamlit/*/*/**" -type f \
+              FILES=$(find . -path "./sample_apps/*" -type f \
                       | sed 's|^\./||' \
-                      | grep -E '^streamlit/[^/]+/[^/]+/' || echo "")
+                      | grep -E '^sample_apps/[^/]+/' || echo "")
               echo "changed_files=$(echo "$FILES" | tr '\n' ',' | sed 's/,$//')" >> $GITHUB_OUTPUT
               exit 0
             fi
@@ -102,18 +103,15 @@ jobs:
 
           # Check for framework changes → deploy ALL apps
           FW=$(git diff --name-only $BASE_SHA HEAD \
-               | grep '^streamlit/framework/' || echo "")
+               | grep '^framework/' || echo "")
           APP=$(git diff --name-only $BASE_SHA HEAD \
-               | grep '^streamlit/' \
-               | grep -E '^streamlit/[^/]+/[^/]+/' \
-               | grep -v '^streamlit/framework/' || echo "")
+               | grep '^sample_apps/' || echo "")
 
           if [ -n "$FW" ]; then
             echo "🏗️ FRAMEWORK CHANGE → deploying ALL apps"
-            FILES=$(find . -path "./streamlit/*/*/**" -type f \
+            FILES=$(find . -path "./sample_apps/*" -type f \
                     | sed 's|^\./||' \
-                    | grep -E '^streamlit/[^/]+/[^/]+/' \
-                    | grep -v '^streamlit/framework/' || echo "")
+                    | grep -E '^sample_apps/[^/]+/' || echo "")
           elif [ -n "$APP" ]; then
             FILES="$APP"
           else
@@ -175,14 +173,12 @@ jobs:
 
               files = [f.strip() for f in changed.split(",") if f.strip()]
 
-              # Identify unique schema/app pairs
-              apps = {}
+              # Identify unique app folders
+              apps = set()
               for fp in files:
                   parts = Path(fp).parts
-                  if len(parts) >= 3 and parts[0] == "streamlit":
-                      schema, app = parts[1], parts[2]
-                      if schema != "framework":
-                          apps.setdefault(schema, set()).add(app)
+                  if len(parts) >= 2 and parts[0] == "sample_apps":
+                      apps.add(parts[1])
 
               if not apps:
                   print("No app changes detected."); return
@@ -198,82 +194,82 @@ jobs:
               )
               cur = conn.cursor()
 
-              fw_config = Path("streamlit/framework/default_config.yaml")
-              fw_dir = Path("streamlit/framework")
+              fw_config = Path("framework/default_config.yaml")
+              fw_dir = Path("framework")
+              schema = os.environ.get("SNOWFLAKE_SCHEMA", "PUBLIC")
 
-              for schema, app_set in apps.items():
-                  cur.execute(f"USE SCHEMA {os.environ['SNOWFLAKE_DATABASE']}.{schema}")
-                  stage = f"{schema}_STREAMLIT_STG"
-                  cur.execute(f"""
-                      CREATE STAGE IF NOT EXISTS {stage}
-                      COMMENT = 'Auto-created for Streamlit apps'
-                  """)
+              cur.execute(f"USE SCHEMA {os.environ['SNOWFLAKE_DATABASE']}.{schema}")
+              stage = f"{schema}_STREAMLIT_STG"
+              cur.execute(f"""
+                  CREATE STAGE IF NOT EXISTS {stage}
+                  COMMENT = 'Auto-created for Streamlit apps'
+              """)
 
-                  for app_name in app_set:
-                      app_dir = Path(f"streamlit/{schema}/{app_name}")
-                      print(f"\n{'='*60}")
-                      print(f"📱 Deploying {schema}.{app_name}")
+              for app_name in apps:
+                  app_dir = Path(f"sample_apps/{app_name}")
+                  print(f"\n{'='*60}")
+                  print(f"📱 Deploying {schema}.{app_name}")
 
-                      # 1. Merge configs
-                      app_cfg = app_dir / "config.yaml"
-                      merged = app_dir / "config.yaml"
-                      if fw_config.exists() and app_cfg.exists():
-                          merge_configs(fw_config, app_cfg, merged)
-                          print(f"✓ Merged config created")
+                  # 1. Merge configs
+                  app_cfg = app_dir / "config.yaml"
+                  merged = app_dir / "config.yaml"
+                  if fw_config.exists() and app_cfg.exists():
+                      merge_configs(fw_config, app_cfg, merged)
+                      print(f"✓ Merged config created")
 
-                      # 2. Upload framework .py files
-                      if fw_dir.exists():
-                          for py in fw_dir.glob("*.py"):
-                              abs_p = py.resolve()
-                              cur.execute(
-                                  f"PUT 'file://{abs_p}' @{stage}/{app_name}/ "
-                                  f"AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
-                              )
-                              print(f"  ↑ {py.name}")
-
-                      # 3. Upload environment.yml
-                      env_yml = fw_dir / "environment.yml"
-                      if env_yml.exists():
+                  # 2. Upload framework .py files
+                  if fw_dir.exists():
+                      for py in fw_dir.glob("*.py"):
+                          abs_p = py.resolve()
                           cur.execute(
-                              f"PUT 'file://{env_yml.resolve()}' @{stage}/{app_name}/ "
+                              f"PUT 'file://{abs_p}' @{stage}/{app_name}/ "
                               f"AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
                           )
+                          print(f"  ↑ {py.name}")
 
-                      # 4. Upload app files (queries.sql, merged config.yaml)
-                      for af in [app_dir / "queries.sql", merged]:
-                          if af.exists():
-                              cur.execute(
-                                  f"PUT 'file://{af.resolve()}' @{stage}/{app_name}/ "
-                                  f"AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
-                              )
-                              print(f"  ↑ {af.name}")
+                  # 3. Upload environment.yml
+                  env_yml = fw_dir / "environment.yml"
+                  if env_yml.exists():
+                      cur.execute(
+                          f"PUT 'file://{env_yml.resolve()}' @{stage}/{app_name}/ "
+                          f"AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+                      )
 
-                      # 5. Create/alter the Streamlit app
-                      compute_pool = os.environ.get("SNOWFLAKE_COMPUTE_POOL", "")
-                      wh = os.environ["SNOWFLAKE_WAREHOUSE"]
-                      db = os.environ["SNOWFLAKE_DATABASE"]
-                      title = app_name.replace("_", " ").title()
+                  # 4. Upload app files (queries.sql, merged config.yaml)
+                  for af in [app_dir / "queries.sql", merged]:
+                      if af.exists():
+                          cur.execute(
+                              f"PUT 'file://{af.resolve()}' @{stage}/{app_name}/ "
+                              f"AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+                          )
+                          print(f"  ↑ {af.name}")
 
-                      if compute_pool:
-                          create_sql = f"""
-                          CREATE OR ALTER STREAMLIT {db}.{schema}.{app_name}
-                              ROOT_LOCATION = '@{db}.{schema}.{stage}/{app_name}'
-                              MAIN_FILE     = 'engine.py'
-                              TITLE         = '{title}'
-                              COMPUTE_POOL  = '{compute_pool}'
-                              QUERY_WAREHOUSE = '{wh}'
-                          """
-                      else:
-                          create_sql = f"""
-                          CREATE OR ALTER STREAMLIT {db}.{schema}.{app_name}
-                              ROOT_LOCATION = '@{db}.{schema}.{stage}/{app_name}'
-                              MAIN_FILE     = 'engine.py'
-                              TITLE         = '{title}'
-                              QUERY_WAREHOUSE = '{wh}'
-                          """
+                  # 5. Create/alter the Streamlit app
+                  compute_pool = os.environ.get("SNOWFLAKE_COMPUTE_POOL", "")
+                  wh = os.environ["SNOWFLAKE_WAREHOUSE"]
+                  db = os.environ["SNOWFLAKE_DATABASE"]
+                  title = app_name.replace("_", " ").title()
 
-                      cur.execute(create_sql)
-                      print(f"✅ {schema}.{app_name} deployed successfully")
+                  if compute_pool:
+                      create_sql = f"""
+                      CREATE OR ALTER STREAMLIT {db}.{schema}.{app_name}
+                          ROOT_LOCATION = '@{db}.{schema}.{stage}/{app_name}'
+                          MAIN_FILE     = 'engine.py'
+                          TITLE         = '{title}'
+                          COMPUTE_POOL  = '{compute_pool}'
+                          QUERY_WAREHOUSE = '{wh}'
+                      """
+                  else:
+                      create_sql = f"""
+                      CREATE OR ALTER STREAMLIT {db}.{schema}.{app_name}
+                          ROOT_LOCATION = '@{db}.{schema}.{stage}/{app_name}'
+                          MAIN_FILE     = 'engine.py'
+                          TITLE         = '{title}'
+                          QUERY_WAREHOUSE = '{wh}'
+                      """
+
+                  cur.execute(create_sql)
+                  print(f"✅ {schema}.{app_name} deployed successfully")
 
               cur.close()
               conn.close()
