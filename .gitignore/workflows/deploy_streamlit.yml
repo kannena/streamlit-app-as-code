@@ -1,0 +1,286 @@
+name: Deploy Streamlit Apps
+
+# Smart CI/CD pipeline for App-as-Code framework:
+#   - Framework change → re-deploy ALL apps (config merge)
+#   - App-only change  → deploy only that app
+#   - Key-pair auth to Snowflake (no passwords)
+#   - Config merging: default_config.yaml + config.yaml → config.yaml
+
+on:
+  push:
+    branches:
+      - develop
+    paths:
+      - "streamlit/framework/**"
+      - "streamlit/*/*/**"
+      - ".github/workflows/deploy_streamlit.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options: [dev, qa, stg]
+      deployment_scope:
+        description: "What to deploy"
+        required: true
+        default: "all"
+        type: choice
+        options: [all, specific-schema, skip]
+      schema_name:
+        description: "Schema name (if specific-schema)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    if: >
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged)
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment || 'DEV' }}
+
+    env:
+      SNOWFLAKE_ACCOUNT:    ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_DATABASE:   ${{ secrets.SNOWFLAKE_DATABASE }}
+      SNOWFLAKE_USER:       ${{ secrets.SNOWFLAKE_DEPLOY_USER }}
+      SNOWFLAKE_ROLE:       ${{ secrets.SNOWFLAKE_DEPLOY_ROLE }}
+      SNOWFLAKE_WAREHOUSE:  ${{ secrets.SNOWFLAKE_DEPLOY_WH }}
+      SNOWFLAKE_COMPUTE_POOL: ${{ secrets.SNOWFLAKE_COMPUTE_POOL }}
+      SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+      SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_PASSPHRASE }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install snowflake-connector-python cryptography
+
+      # ─── Detect what changed ─────────────────────────────────────
+      - name: Detect changed files
+        id: changed-files
+        run: |
+          echo "=== DETECTING CHANGED FILES ==="
+          git fetch --depth=50 origin ${{ github.ref_name }}
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SCOPE="${{ github.event.inputs.deployment_scope || 'all' }}"
+            SCHEMA="${{ github.event.inputs.schema_name || '' }}"
+
+            if [ "$SCOPE" = "skip" ]; then
+              echo "changed_files=SKIP_DEPLOYMENT" >> $GITHUB_OUTPUT
+              exit 0
+            elif [ "$SCOPE" = "specific-schema" ] && [ -n "$SCHEMA" ]; then
+              FILES=$(find . -path "./streamlit/$SCHEMA/*/**" -type f \
+                      | sed 's|^\./||' || echo "")
+              echo "changed_files=$(echo "$FILES" | tr '\n' ',' | sed 's/,$//')" >> $GITHUB_OUTPUT
+              exit 0
+            else
+              FILES=$(find . -path "./streamlit/*/*/**" -type f \
+                      | sed 's|^\./||' \
+                      | grep -E '^streamlit/[^/]+/[^/]+/' || echo "")
+              echo "changed_files=$(echo "$FILES" | tr '\n' ',' | sed 's/,$//')" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+          BASE_SHA="${{ github.event.before }}"
+
+          # Check for framework changes → deploy ALL apps
+          FW=$(git diff --name-only $BASE_SHA HEAD \
+               | grep '^streamlit/framework/' || echo "")
+          APP=$(git diff --name-only $BASE_SHA HEAD \
+               | grep '^streamlit/' \
+               | grep -E '^streamlit/[^/]+/[^/]+/' \
+               | grep -v '^streamlit/framework/' || echo "")
+
+          if [ -n "$FW" ]; then
+            echo "🏗️ FRAMEWORK CHANGE → deploying ALL apps"
+            FILES=$(find . -path "./streamlit/*/*/**" -type f \
+                    | sed 's|^\./||' \
+                    | grep -E '^streamlit/[^/]+/[^/]+/' \
+                    | grep -v '^streamlit/framework/' || echo "")
+          elif [ -n "$APP" ]; then
+            FILES="$APP"
+          else
+            echo "No streamlit changes detected."
+            echo "changed_files=SKIP_DEPLOYMENT" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "changed_files=$(echo "$FILES" | tr '\n' ',' | sed 's/,$//')" >> $GITHUB_OUTPUT
+
+      - name: Skip deployment notification
+        if: steps.changed-files.outputs.changed_files == 'SKIP_DEPLOYMENT'
+        run: echo "🚫 No Streamlit changes — skipping deployment."
+
+      # ─── Deploy to Snowflake ─────────────────────────────────────
+      - name: Deploy to Snowflake
+        if: steps.changed-files.outputs.changed_files != 'SKIP_DEPLOYMENT'
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.changed_files }}
+        run: |
+          cat > deploy.py << 'PYEOF'
+          """
+          Deployment script:
+          1. Connect to Snowflake with key-pair auth
+          2. For each changed app:
+             a. Merge default_config.yaml + config.yaml → config.yaml
+             b. Upload framework .py files + merged config + queries.sql to stage
+             c. CREATE OR ALTER STREAMLIT pointing to the stage
+          """
+          import os, sys, shutil, subprocess
+          from pathlib import Path
+          import snowflake.connector
+          from cryptography.hazmat.primitives import serialization
+          from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+          def get_private_key():
+              raw = os.environ["SNOWFLAKE_PRIVATE_KEY"].encode()
+              pw = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", "").strip()
+              pk = load_pem_private_key(raw, password=pw.encode() if pw else None)
+              return pk.private_bytes(
+                  serialization.Encoding.DER,
+                  serialization.PrivateFormat.PKCS8,
+                  serialization.NoEncryption(),
+              )
+
+          def merge_configs(fw_path, app_path, out_path):
+              """Concatenate framework + app YAML (app overrides framework)."""
+              if os.name == "nt":
+                  subprocess.run(f'type "{fw_path}" "{app_path}" > "{out_path}"',
+                                 shell=True, check=True)
+              else:
+                  subprocess.run(f'cat "{fw_path}" "{app_path}" > "{out_path}"',
+                                 shell=True, check=True)
+
+          def main():
+              changed = os.environ.get("CHANGED_FILES", "")
+              if not changed:
+                  print("No files to deploy."); return
+
+              files = [f.strip() for f in changed.split(",") if f.strip()]
+
+              # Identify unique schema/app pairs
+              apps = {}
+              for fp in files:
+                  parts = Path(fp).parts
+                  if len(parts) >= 3 and parts[0] == "streamlit":
+                      schema, app = parts[1], parts[2]
+                      if schema != "framework":
+                          apps.setdefault(schema, set()).add(app)
+
+              if not apps:
+                  print("No app changes detected."); return
+
+              pk = get_private_key()
+              conn = snowflake.connector.connect(
+                  account=os.environ["SNOWFLAKE_ACCOUNT"],
+                  user=os.environ["SNOWFLAKE_USER"],
+                  private_key=pk,
+                  role=os.environ["SNOWFLAKE_ROLE"],
+                  warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
+                  database=os.environ["SNOWFLAKE_DATABASE"],
+              )
+              cur = conn.cursor()
+
+              fw_config = Path("streamlit/framework/default_config.yaml")
+              fw_dir = Path("streamlit/framework")
+
+              for schema, app_set in apps.items():
+                  cur.execute(f"USE SCHEMA {os.environ['SNOWFLAKE_DATABASE']}.{schema}")
+                  stage = f"{schema}_STREAMLIT_STG"
+                  cur.execute(f"""
+                      CREATE STAGE IF NOT EXISTS {stage}
+                      COMMENT = 'Auto-created for Streamlit apps'
+                  """)
+
+                  for app_name in app_set:
+                      app_dir = Path(f"streamlit/{schema}/{app_name}")
+                      print(f"\n{'='*60}")
+                      print(f"📱 Deploying {schema}.{app_name}")
+
+                      # 1. Merge configs
+                      app_cfg = app_dir / "config.yaml"
+                      merged = app_dir / "config.yaml"
+                      if fw_config.exists() and app_cfg.exists():
+                          merge_configs(fw_config, app_cfg, merged)
+                          print(f"✓ Merged config created")
+
+                      # 2. Upload framework .py files
+                      if fw_dir.exists():
+                          for py in fw_dir.glob("*.py"):
+                              abs_p = py.resolve()
+                              cur.execute(
+                                  f"PUT 'file://{abs_p}' @{stage}/{app_name}/ "
+                                  f"AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+                              )
+                              print(f"  ↑ {py.name}")
+
+                      # 3. Upload environment.yml
+                      env_yml = fw_dir / "environment.yml"
+                      if env_yml.exists():
+                          cur.execute(
+                              f"PUT 'file://{env_yml.resolve()}' @{stage}/{app_name}/ "
+                              f"AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+                          )
+
+                      # 4. Upload app files (queries.sql, merged config.yaml)
+                      for af in [app_dir / "queries.sql", merged]:
+                          if af.exists():
+                              cur.execute(
+                                  f"PUT 'file://{af.resolve()}' @{stage}/{app_name}/ "
+                                  f"AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+                              )
+                              print(f"  ↑ {af.name}")
+
+                      # 5. Create/alter the Streamlit app
+                      compute_pool = os.environ.get("SNOWFLAKE_COMPUTE_POOL", "")
+                      wh = os.environ["SNOWFLAKE_WAREHOUSE"]
+                      db = os.environ["SNOWFLAKE_DATABASE"]
+                      title = app_name.replace("_", " ").title()
+
+                      if compute_pool:
+                          create_sql = f"""
+                          CREATE OR ALTER STREAMLIT {db}.{schema}.{app_name}
+                              ROOT_LOCATION = '@{db}.{schema}.{stage}/{app_name}'
+                              MAIN_FILE     = 'engine.py'
+                              TITLE         = '{title}'
+                              COMPUTE_POOL  = '{compute_pool}'
+                              QUERY_WAREHOUSE = '{wh}'
+                          """
+                      else:
+                          create_sql = f"""
+                          CREATE OR ALTER STREAMLIT {db}.{schema}.{app_name}
+                              ROOT_LOCATION = '@{db}.{schema}.{stage}/{app_name}'
+                              MAIN_FILE     = 'engine.py'
+                              TITLE         = '{title}'
+                              QUERY_WAREHOUSE = '{wh}'
+                          """
+
+                      cur.execute(create_sql)
+                      print(f"✅ {schema}.{app_name} deployed successfully")
+
+              cur.close()
+              conn.close()
+              print(f"\n{'='*60}\n🎉 Deployment complete!")
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+          python deploy.py
